@@ -1,0 +1,38 @@
+artifact_path: /Users/subashanannair/Documents/00_forward/COHORTS/16_MARCH_2026/updated_SPD_2026/ML_FLOW_TEST/mlruns/3/models/m-6181b5a50f524644af91525d30381e5a/artifacts
+flavors:
+  python_function:
+    data: model.ubj
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.xgboost
+    python_version: 3.12.13
+  xgboost:
+    code: null
+    data: model.ubj
+    model_class: xgboost.sklearn.XGBClassifier
+    model_format: ubj
+    xgb_version: 3.2.0
+is_signature_from_type_hint: false
+mlflow_version: 3.12.0
+model_id: m-6181b5a50f524644af91525d30381e5a
+model_size_bytes: 458664
+model_uuid: m-6181b5a50f524644af91525d30381e5a
+prompts: null
+run_id: 9ecfdb0daff5428bbc728112608cbfd7
+saved_input_example_info:
+  artifact_path: input_example.json
+  pandas_orient: split
+  serving_input_path: serving_input_example.json
+  type: dataframe
+signature:
+  inputs: '[{"type": "long", "name": "pregnancies", "required": true}, {"type": "long",
+    "name": "glucose", "required": true}, {"type": "long", "name": "diastolic", "required":
+    true}, {"type": "long", "name": "triceps", "required": true}, {"type": "long",
+    "name": "insulin", "required": true}, {"type": "double", "name": "bmi", "required":
+    true}, {"type": "double", "name": "dpf", "required": true}, {"type": "long", "name":
+    "age", "required": true}]'
+  outputs: '[{"type": "long", "required": true}]'
+  params: null
+type_hint_from_example: false
+utc_time_created: '2026-05-11 13:31:30.685065'

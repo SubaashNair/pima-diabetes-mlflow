@@ -1,0 +1,2 @@
+model_name: pima_diabetes_rf_classifier
+model_version: '2'

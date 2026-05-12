@@ -1,0 +1,10 @@
+mlruns/
+mlflow.db
+.idea/
+.ruff_cache/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.DS_Store
