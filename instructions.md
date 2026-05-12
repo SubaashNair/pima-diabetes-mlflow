@@ -629,6 +629,162 @@ CMD ["./start.sh"]
 - `MODEL_API_URL` is an env var so the Streamlit app can be reconfigured at runtime without rebuilding.
 - `EXPOSE 7860` is informational; the actual binding happens in `start.sh`.
 
+### G4.1. Line by line
+
+Every line in a Dockerfile becomes a **layer** in the resulting image. Order matters for cache reuse and image size. Here is what each line does and why it sits where it does.
+
+#### Line 1: `FROM python:3.12-slim`
+
+- **`FROM`** is the only instruction every Dockerfile must start with. It declares the base layer — every subsequent line builds on top of it.
+- **`python:3.12`** is the official Python image. The `3.12` tag specifically matters here because `model/MLmodel` records `python_version: 3.12.13`. A different Python major (3.11 / 3.13) breaks deserialization of scikit-learn objects.
+- **`-slim`** is a Debian-based variant stripped of optional system tooling. It is ~40 MB compared to the full `python:3.12` image at ~900 MB. The tradeoff is fewer system libraries pre-installed — if you need build tools later, you install them yourself.
+
+Alternative tags you might see: `python:3.12-alpine` (even smaller but uses musl libc, which breaks scientific Python wheels), `python:3.12` (full Debian, large), `python:3.12-bookworm` (explicit Debian version pin).
+
+#### Line 3: `WORKDIR /app`
+
+- Sets the **working directory** inside the image. Every subsequent `RUN`, `COPY`, `CMD`, and `ENTRYPOINT` runs relative to this path.
+- Docker creates the directory if it doesn't exist.
+- Without `WORKDIR`, everything happens in `/` which is messy and mixes your app with system files.
+- `/app` is a convention; you could use any path. `/srv` and `/opt/app` are also common.
+
+#### Lines 5–7: Installing system packages
+
+```dockerfile
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+This is **one** `RUN` instruction spanning three lines via backslash continuation. Why one RUN, not three?
+
+- Each `RUN` creates a new layer. If we split this into three RUNs, the `apt-get update` cache (~30 MB) gets baked into its own layer that no later step can remove. Chained with `&&` and `rm -rf` at the end, the cache never makes it into a permanent layer.
+
+Breaking down the chain:
+
+- **`apt-get update`** refreshes Debian's package index. Without it, `apt-get install` would either fail or install stale versions.
+- **`&&`** is shell logic: run the next command only if the previous succeeded. Stops the build immediately on any failure (better than silent skips).
+- **`apt-get install -y`**: `-y` auto-answers "yes" to prompts. In a non-interactive build there's no user to confirm.
+- **`--no-install-recommends`** skips Debian's recommended-but-optional packages. Default behavior installs them; we don't want bloat.
+- **`curl`** is the only system tool we install. It's used in `start.sh` for the health-check loop that waits for the MLflow server to come up.
+- **`rm -rf /var/lib/apt/lists/*`** deletes the apt package index after install — same trick again, saves ~30 MB.
+
+#### Lines 9–10: Python dependencies, copied separately for cache efficiency
+
+```dockerfile
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+```
+
+- **`COPY requirements.txt .`** copies `requirements.txt` from the **build context** (your local project folder) into `/app/` (the `.` means the current `WORKDIR`).
+- **Why copy this file before the source code?** Docker caches each layer. If `requirements.txt` hasn't changed since the last build, Docker re-uses the cached `pip install` layer — even if your Python source code changed. If you copied everything at once, every code change would bust the pip cache and force a full reinstall (3–5 minutes).
+- This pattern is sometimes called the **"copy-deps-then-code"** idiom and it's one of the most important Dockerfile optimizations.
+
+For the pip install itself:
+
+- **`pip install`** installs Python packages.
+- **`--no-cache-dir`** disables pip's local cache (`~/.cache/pip/`). The cache stores downloaded wheels for reuse on subsequent installs — useful on a dev laptop, useless in a Docker image because the image only installs once. Disabling saves ~200 MB.
+- **`-r requirements.txt`** reads package names from the file.
+
+#### Lines 12–13: Copying the model artifact
+
+```dockerfile
+COPY model/ /opt/ml/model/
+```
+
+- Copies the entire `model/` directory from the build context into `/opt/ml/model/` inside the image.
+- The trailing slash on the destination is important: it tells Docker the target is a directory, not a file rename.
+- **`/opt/ml/model`** is MLflow's conventional path. The auto-generated Dockerfile from `mlflow models build-docker` uses the same location, so `mlflow models serve -m /opt/ml/model` works without arguments.
+- We copy the model **after** `pip install` because the model rarely changes during development. If we copied it before, every model retraining would bust the pip cache.
+
+#### Line 13: Copying the app code and entrypoint
+
+```dockerfile
+COPY streamlit_client.py start.sh ./
+```
+
+- Copies **two source files** into the current `WORKDIR` (`/app/`). The trailing `./` is the destination.
+- These come last because they change most often during development. Putting them at the end keeps every earlier layer cached.
+
+#### Line 14: Making the entrypoint executable
+
+```dockerfile
+RUN chmod +x start.sh
+```
+
+- **`chmod +x`** adds the execute permission bit.
+- Why is this needed? `COPY` preserves the file mode from your local filesystem. If you cloned the repo on Windows, or if your text editor stripped the executable bit, `./start.sh` would fail with "Permission denied" at container startup.
+- Running `chmod` inside the image guarantees it's executable regardless of how the file got into the build context.
+
+#### Line 16: Setting an environment variable
+
+```dockerfile
+ENV MODEL_API_URL=http://127.0.0.1:5001
+```
+
+- **`ENV`** sets an environment variable that **persists into every process** the container runs.
+- `streamlit_client.py` reads this with `os.environ.get("MODEL_API_URL", "http://127.0.0.1:5001")`. Inside our container, both default and ENV value agree, so the variable is technically redundant — but it documents the contract and lets users override at runtime:
+
+```bash
+docker run -e MODEL_API_URL=http://some-other-host:5001 pima-demo
+```
+
+- Difference from `ARG`: `ARG` only exists at build time and disappears in the final image. `ENV` persists into running containers.
+
+#### Line 18: Documenting the listening port
+
+```dockerfile
+EXPOSE 7860
+```
+
+- This is **documentation only**. It does NOT open a port or change networking.
+- It tells anyone reading the Dockerfile (and some tools like Docker Desktop's GUI) that the container is *expected* to listen on TCP port 7860.
+- To actually publish the port to your host, you still need `-p 7860:7860` on `docker run`.
+- HF Spaces reads this in some workflows but mostly relies on the `app_port` field in your `README.md` frontmatter.
+
+Why 7860? It's HF Spaces' default port — using anything else means extra config in the Space frontmatter.
+
+#### Line 20: The container's startup command
+
+```dockerfile
+CMD ["./start.sh"]
+```
+
+- **`CMD`** declares the **default command** run when the container starts.
+- The **exec form** (JSON array syntax `["./start.sh"]`) directly invokes the binary, without spawning a shell. Compare with the shell form (`CMD ./start.sh`) which is equivalent to `sh -c './start.sh'`.
+- **Why exec form matters:** signals from Docker (`SIGTERM` on `docker stop`) reach your process directly. In shell form, the signal hits `sh`, which doesn't forward it to your script — your container takes the full 10-second timeout to die.
+- `CMD` is **overridable** at runtime: `docker run pima-demo /bin/bash` ignores `start.sh` and gives you a shell. Compare with `ENTRYPOINT` which is *not* overridden by trailing args — used when you want a binary that always runs.
+
+For our use case, `CMD` is the right choice — easy to swap into a shell for debugging without rebuilding.
+
+### G4.2. The mental model
+
+Read the Dockerfile top-to-bottom as a layered cake:
+
+```
+┌─────────────────────────────────────────┐
+│ Layer 8: CMD ["./start.sh"]             │ ← changes only when entrypoint changes
+├─────────────────────────────────────────┤
+│ Layer 7: EXPOSE 7860                    │
+├─────────────────────────────────────────┤
+│ Layer 6: ENV MODEL_API_URL=...          │
+├─────────────────────────────────────────┤
+│ Layer 5: chmod +x start.sh              │
+├─────────────────────────────────────────┤
+│ Layer 4: COPY streamlit_client.py ...   │ ← changes on every code edit
+├─────────────────────────────────────────┤
+│ Layer 3: COPY model/ ...                │ ← changes on model retrain
+├─────────────────────────────────────────┤
+│ Layer 2: pip install -r requirements.txt│ ← changes when deps change (rare)
+├─────────────────────────────────────────┤
+│ Layer 1: apt-get install curl           │ ← changes almost never
+├─────────────────────────────────────────┤
+│ Layer 0: FROM python:3.12-slim          │ ← rebases when Python version updates
+└─────────────────────────────────────────┘
+```
+
+When you change one line, **that layer and every layer above it** rebuild. Everything below stays cached. Hence "least-changing things at the bottom, most-changing at the top."
+
 ### G5. start.sh
 
 ```bash
