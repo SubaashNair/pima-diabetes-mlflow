@@ -818,6 +818,145 @@ exec streamlit run streamlit_client.py \
 
 **Why `exec`?** Replaces the shell with Streamlit so signals (SIGTERM from Docker stop) reach Streamlit directly, allowing clean shutdown.
 
+### G5.1. Line by line
+
+`start.sh` is short but every line is doing real work. The script has three phases: launch the API in the background, wait for it to be healthy, then replace itself with Streamlit. Here is what each line does.
+
+#### Line 1: `#!/usr/bin/env bash`
+
+- The **shebang line**. Tells the OS which interpreter to run this file with.
+- **`/usr/bin/env bash`** is a portable trick: instead of hard-coding `/bin/bash`, ask the `env` command to find `bash` on the system's `PATH`. Works whether bash lives at `/bin/bash` (most Linux), `/usr/local/bin/bash` (Homebrew on macOS), or anywhere else.
+- Why not `#!/bin/sh`? On Debian-based systems `sh` is `dash`, a stripped-down shell that lacks features we use (the `if` test syntax is OK, but `set -o pipefail` and arrays would break).
+- The shebang only takes effect when the file is **executed directly** (e.g. `./start.sh`). Running `bash start.sh` ignores the shebang.
+
+#### Line 2: `set -e`
+
+- **"Exit immediately on any non-zero exit status."** Without this, a failing command lets the script keep marching forward — usually into more confusing errors.
+- Example without `set -e`:
+  - `mlflow models serve` fails because the model path is wrong
+  - Script continues, hits the `curl` loop, loops 60 times (60 seconds wasted)
+  - Streamlit eventually launches but cannot talk to a dead API
+  - User sees "API unreachable" in the UI and has no idea the real problem is upstream
+
+- Example with `set -e`:
+  - `mlflow models serve` fails
+  - Script exits immediately
+  - Container exits with non-zero status
+  - HF Spaces (or Docker) sees the failure and surfaces it in logs
+
+- Related options worth knowing: `set -u` (error on unset variables), `set -o pipefail` (catch failures in piped commands). For this script just `set -e` is enough.
+
+#### Lines 4–8: Launching the MLflow scoring server in the background
+
+```bash
+mlflow models serve \
+  -m /opt/ml/model \
+  --host 0.0.0.0 \
+  --port 5001 \
+  --env-manager local &
+```
+
+- **`\`** at end of line: line continuation. The shell treats lines 4–8 as one command. Pure formatting — improves readability of long flag lists.
+- **`mlflow models serve`** is the same CLI command from Part E, just running inside the container.
+- **`-m /opt/ml/model`**: model path. Matches the `COPY model/ /opt/ml/model/` line in the Dockerfile. The path is hard-coded here because it's controlled by us, not the user.
+- **`--host 0.0.0.0`** is **critical**. Bound to `127.0.0.1`, the server would only be reachable from inside its own process — Streamlit (a sibling process in the same container) would not see it. `0.0.0.0` means "all network interfaces."
+- **`--port 5001`** matches what `streamlit_client.py` expects via `MODEL_API_URL=http://127.0.0.1:5001`.
+- **`--env-manager local`** uses the current Python env (the one we installed via the Dockerfile's `pip install`). Alternatives:
+  - `virtualenv` — MLflow creates a fresh venv and reinstalls deps
+  - `conda` — MLflow creates a fresh conda env
+  - Both would add ~5 minutes to startup time and ignore our carefully pinned `requirements.txt`. We pre-installed exactly what the model needs, so `local` is correct.
+- **`&`** at the very end: **fork the process into the background**. Without it, this command would block forever (the server runs indefinitely) and the rest of the script would never execute.
+
+#### Line 10: Status message
+
+```bash
+echo "Waiting for MLflow scoring server on :5001..."
+```
+
+- Prints a status line to the container's stdout, which appears in `docker logs` and on HF Spaces' "Logs" tab. Pure observability — helps you debug "what is the container doing right now?" when boot is slow.
+
+#### Lines 11–17: The health-check polling loop
+
+```bash
+for i in $(seq 1 60); do
+  if curl -sf http://127.0.0.1:5001/health > /dev/null; then
+    echo "MLflow scoring server is up."
+    break
+  fi
+  sleep 1
+done
+```
+
+Why this exists: `mlflow models serve` returns its prompt the moment the *process* starts, but the HTTP server inside it takes 5–20 seconds to actually accept connections (initializing the model, opening a SQLite tracking DB, registering FastAPI routes). If Streamlit launched immediately, the first user request would fail with a connection-refused error.
+
+Line-by-line:
+
+- **`for i in $(seq 1 60); do`**
+  - `seq 1 60` generates the numbers 1, 2, 3, …, 60 (one per line).
+  - `$(...)` is **command substitution**: run the inner command, paste its output here.
+  - `for i in ...; do ... done` is bash's for loop.
+  - Net effect: run the loop body up to 60 times. The variable `i` isn't actually used — we just need a counter to cap the total wait.
+
+- **`if curl -sf http://127.0.0.1:5001/health > /dev/null; then`**
+  - **`curl`** sends an HTTP request.
+  - **`-s`** (silent): suppress curl's progress bar and connection logs. Without it, the container logs fill up with curl noise every second.
+  - **`-f`** (fail): make curl exit with a non-zero code when the HTTP response is 4xx/5xx. Without `-f`, curl returns 0 even for HTTP 500 (it successfully made a request), which would make the `if` think the server is healthy when it isn't.
+  - **`http://127.0.0.1:5001/health`**: probe the health endpoint. We use `127.0.0.1` here (not `0.0.0.0`) because we're probing **inside** the container — loopback is fine.
+  - **`> /dev/null`**: discard curl's stdout. We only care about its exit code, not its response body.
+  - The `if` tests curl's exit code: 0 = healthy, non-zero = not yet.
+
+- **`echo "MLflow scoring server is up."`** and **`break`** — log success and exit the loop early. Without `break`, the loop would continue uselessly for the remaining iterations.
+
+- **`sleep 1`** — wait one second before the next probe. Without it the loop would hammer the server thousands of times per second and pin a CPU core for no benefit.
+
+- **`done`** — closes the for loop.
+
+**Edge case:** what if the server never comes up? After 60 iterations (60 seconds), the loop exits naturally without setting any flag. The script then tries to `exec streamlit` and Streamlit launches anyway — users will see "API unreachable" in the sidebar. We don't `exit 1` here because Streamlit can still serve its UI, and seeing a clear error in the sidebar is more useful than the container crashing into a restart loop.
+
+#### Lines 19–22: Handing control to Streamlit
+
+```bash
+exec streamlit run streamlit_client.py \
+  --server.port 7860 \
+  --server.address 0.0.0.0 \
+  --server.headless true
+```
+
+- **`exec`** is the most important word here. Without `exec`, bash would **fork** a child process for Streamlit and **wait** for it. With `exec`, bash **replaces itself** with the Streamlit process — there's no shell sitting in the middle.
+- **Why this matters:** when Docker stops the container (`docker stop`, or HF Spaces shutdown), it sends `SIGTERM` to PID 1. With `exec`, PID 1 IS Streamlit, so Streamlit gets the signal and shuts down cleanly. Without `exec`, PID 1 is bash, bash doesn't forward `SIGTERM` to its child, and Docker kills everything after a 10-second timeout. Cleaner shutdown = no half-written files = happier health checks.
+- **`streamlit run streamlit_client.py`** is the standard launcher.
+- **`--server.port 7860`** matches `EXPOSE 7860` in the Dockerfile and `app_port: 7860` in `README.md` frontmatter. All three must agree.
+- **`--server.address 0.0.0.0`** — same reasoning as MLflow's `--host 0.0.0.0`. Streamlit's default is `localhost` which would make the UI invisible from outside the container.
+- **`--server.headless true`** disables Streamlit's first-run telemetry prompt and its attempt to auto-open a browser. In a container there's no browser to open and no user to answer prompts.
+
+### G5.2. The execution timeline
+
+```
+t=0.0s    Container starts. start.sh begins.
+t=0.0s    set -e armed.
+t=0.0s    mlflow models serve forks into background.
+t=0.0s    Status echo printed.
+t=0.0s    Loop iteration 1: curl /health → connection refused (server still booting).
+t=1.0s    Loop iteration 2: curl /health → connection refused.
+   ...
+t=8.0s    Loop iteration 9: curl /health → 200 OK.
+t=8.0s    "MLflow scoring server is up." printed. break.
+t=8.0s    exec streamlit. bash is replaced; Streamlit becomes PID 1.
+t=10.0s   Streamlit's own boot complete. UI is reachable on :7860.
+```
+
+The total cold-boot time is dominated by MLflow's startup (~8s) and Streamlit's startup (~2s), giving HF Spaces' "starting up" indicator about 10–12 seconds before the UI becomes interactive.
+
+### G5.3. Why a shell script, not a Python supervisor?
+
+You might ask: why not use `supervisord`, `s6-overlay`, or a Python script with `subprocess.Popen` to manage both processes?
+
+- **`supervisord`**: heavier (extra package, config file, separate PID 1), and we don't need any of its features (auto-restart, log rotation, web UI).
+- **`s6-overlay`**: powerful but adds complexity that obscures the teaching value.
+- **Python supervisor**: would require a long-running Python process just to launch two children; signal handling becomes manual work.
+
+A 20-line bash script is the simplest thing that works. The tradeoff: if MLflow crashes mid-run, nothing restarts it. For a teaching demo that's acceptable. For production, swap in `supervisord`.
+
 ### G6. Building and running locally
 
 ```bash
