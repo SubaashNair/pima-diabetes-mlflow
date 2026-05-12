@@ -21,8 +21,9 @@ This document is the **how and the why** of every step. If you only want command
 11. [Part I — Pushing to GitHub](#part-i--pushing-to-github)
 12. [Part J — Deploying to Hugging Face Spaces](#part-j--deploying-to-hugging-face-spaces)
 13. [Part K — CI/CD: GitHub Actions Sync to HF](#part-k--cicd-github-actions-sync-to-hf)
-14. [Troubleshooting](#troubleshooting)
-15. [Glossary](#glossary)
+14. [Part L — Why this app won't run on Streamlit Community Cloud as-is](#part-l--why-this-app-wont-run-on-streamlit-community-cloud-as-is)
+15. [Troubleshooting](#troubleshooting)
+16. [Glossary](#glossary)
 
 ---
 
@@ -1068,6 +1069,163 @@ git push origin main
 # Action mirrors to HF automatically
 # Space rebuilds within seconds of the push
 ```
+
+---
+
+## Part L — Why this app won't run on Streamlit Community Cloud as-is
+
+A common question: "I already have a Streamlit app — why can't I just deploy it to share.streamlit.io and skip everything else?" Short answer: because the app is **two-tier**, and Streamlit Community Cloud only hosts the UI tier.
+
+### L1. The architecture mismatch
+
+What the current app does at every "Predict" click:
+
+```
+[Browser] ──► [Streamlit process] ──HTTP──► [MLflow scoring server] ──► [model.predict()]
+                                            (at http://127.0.0.1:5001)
+```
+
+There are **two separate processes** — Streamlit on one port, the MLflow scoring server on another. Inside our Docker container they coexist, so `127.0.0.1:5001` resolves to the MLflow process running next to Streamlit. That works because both processes are inside the same network namespace.
+
+Streamlit Community Cloud runs **only your Streamlit process**. There is no second container, no MLflow server next door. When Streamlit Cloud's Python process tries to `requests.post("http://127.0.0.1:5001/invocations", ...)`, it hits nothing — `127.0.0.1` on Streamlit Cloud's runner is Streamlit Cloud, and Streamlit Cloud has no MLflow server.
+
+This is not a bug, a config gap, or a missing token. It is a fundamental architecture mismatch.
+
+### L2. The three ways to bridge the gap
+
+| Option | What you change | Cost | Trade-off |
+|---|---|---|---|
+| **A. Embed the model** | Load `model/` directly in Python, drop the HTTP call | Free | Loses the REST-API teaching surface |
+| **B. Deploy the API publicly** | Host MLflow on a second service, point Streamlit at its URL | $ on the API tier | Keeps two-tier teaching architecture |
+| **C. Stay on HF Spaces** | Do nothing | Free | UI domain is `huggingface.co/spaces/...` not `*.streamlit.app` |
+
+### L3. Option A — Embed the model in Streamlit (recommended)
+
+Streamlit Community Cloud is built for single-process apps. Collapse the two tiers into one by loading the model directly.
+
+**Code change.** Add at the top of `streamlit_client.py`:
+
+```python
+import mlflow.xgboost
+import pandas as pd
+import streamlit as st
+
+@st.cache_resource
+def load_model():
+    """Load once per Streamlit session; reused across reruns."""
+    return mlflow.xgboost.load_model("model")  # relative path to the bundled artifact
+
+model = load_model()
+```
+
+Then replace HTTP calls. Where you had:
+
+```python
+predictions = call_model_api(records, api_url)
+```
+
+write:
+
+```python
+predictions = model.predict(pd.DataFrame(records)).tolist()
+```
+
+Delete `check_health` and the sidebar URL input — there is no remote API anymore. The "curl equivalent" expander becomes irrelevant; replace it with a "Python equivalent" if you want to keep teaching the underlying call.
+
+**`@st.cache_resource` is important.** Without it, Streamlit reloads the model on every interaction (every form submission, every rerun). With it, the model is loaded once per session and kept in memory.
+
+**Two extra files you need:**
+
+1. **`requirements.txt`** — Streamlit Cloud reads this. The existing one already pins `mlflow`, `xgboost`, `scikit-learn`, etc.
+2. **`packages.txt`** — system-level apt packages. Add one line:
+
+```text
+git-lfs
+```
+
+This tells Streamlit Cloud to install `git-lfs` so it can fetch the actual `model.ubj` content when cloning your repo. Without it, the runner gets the LFS pointer file (~100 bytes saying "this is an LFS file"), and `load_model("model")` crashes because `model.ubj` is unreadable.
+
+**Connecting the repo.**
+
+1. Go to https://share.streamlit.io
+2. Click **New app** → pick your `pima-diabetes-mlflow` repo
+3. Main file path: `streamlit_client.py`
+4. Branch: `main`
+5. **Advanced settings** → leave Python version at default (3.12+) or pin to match
+6. Click **Deploy**
+
+First boot takes ~3–5 minutes (LFS fetch + pip install). Subsequent deploys re-run on every `git push origin main`.
+
+### L4. Option B — Deploy the API separately
+
+Keep the two-tier architecture by giving the MLflow scoring server a public URL.
+
+**Picking a host.** Any of these work; pick by your familiarity:
+
+| Host | Free tier | Cold start | Notes |
+|---|---|---|---|
+| Fly.io | Generous, Docker-first | ~5s | Best DX for Docker; `fly launch` from your Dockerfile |
+| Railway | $5/mo credit | ~10s | Easiest UI; one-click Docker deploys |
+| Render | Free for low traffic | ~30s on cold | Sleeps after 15 min inactivity on free tier |
+| Google Cloud Run | Pay-per-use, scales to zero | ~1–3s | Cheapest at low volume; needs `gcloud` setup |
+
+**Modify the Dockerfile.** For an API-only deployment, strip the Streamlit half from `start.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -e
+exec mlflow models serve \
+  -m /opt/ml/model \
+  --host 0.0.0.0 \
+  --port ${PORT:-5001} \
+  --env-manager local
+```
+
+Most platforms inject a `$PORT` env var the app must bind to. The `${PORT:-5001}` default makes the same image work locally and on the platform.
+
+**Wire Streamlit Cloud to the API.**
+
+In Streamlit Cloud's app settings → **Secrets**, add:
+
+```toml
+MODEL_API_URL = "https://your-mlflow-api.fly.dev"
+```
+
+Your existing code already reads this env var, so no code change in `streamlit_client.py`. Add `os.environ` shim if you want to also read from `st.secrets`:
+
+```python
+import os
+import streamlit as st
+
+DEFAULT_API_URL = (
+    st.secrets.get("MODEL_API_URL")
+    or os.environ.get("MODEL_API_URL")
+    or "http://127.0.0.1:5001"
+)
+```
+
+### L5. Option C — Just use the HF Space
+
+The HF Space at `https://huggingface.co/spaces/<user>/<space>` already publicly serves the Streamlit UI with the model embedded inside the same container. That is effectively Option A, already deployed, already public, already free. No additional work.
+
+The only reason to prefer Streamlit Community Cloud is the `*.streamlit.app` URL or its integration with Streamlit's own analytics dashboard. Otherwise the HF Space gives the same experience to your students.
+
+### L6. Decision matrix
+
+| If you want… | Pick |
+|---|---|
+| Free, fastest path, on `*.streamlit.app` | Option A (embed model) |
+| To teach the REST API tier explicitly | Option B (separate API) |
+| Already done, no extra work | Option C (HF Space) |
+
+### L7. Common mistakes when deploying to Streamlit Community Cloud
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `FileNotFoundError: model.ubj` on boot | LFS not enabled on the runner | Add `packages.txt` with `git-lfs` |
+| `ModuleNotFoundError: No module named 'mlflow'` | Streamlit Cloud installed only what it heuristically detected | Ensure `requirements.txt` is at repo root, not in a subfolder |
+| App boots but "API unreachable" in sidebar | Tried Option A but left the `requests` code in | Remove `call_model_api` and call `model.predict()` directly |
+| Build hangs on `pip install xgboost` | Free tier sometimes hits memory limits installing big wheels | Use `xgboost==3.2.0` (pre-built CPU wheels) and remove `nvidia-*` from deps |
 
 ---
 
